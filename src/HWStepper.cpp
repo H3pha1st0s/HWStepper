@@ -11,7 +11,7 @@ struct HWTimerInput
 {
 	uint32_t PinRegister;
 	uint32_t mask;
-	uint64_t WaitBefore; //time to wait between the pulse before this one and this one
+	uint64_t WaitBefore;    // time to wait between the pulse before this one and this one
 };
 
 struct HWStepperMotorInternal
@@ -47,30 +47,30 @@ struct HWStepperMotorInternal
 	uint32_t DirSetRegister;
 	uint32_t DirClearRegister;
 
-	int64_t DeltaToTarget() //Positive if position neeeds to increase
+	int64_t DeltaToTarget()    // Positive if position neeeds to increase
 	{
 		return target-position;
 	}
 
 	int64_t GetDistanceToTarget()
 	{
-		return abs(position - target);
+		return llabs(position - target);
 	}
 
 	int64_t GetBrakingDistance()
 	{
-		if (abs(Speed) <= StartSpeed)
-		{
-			return 0;
-		}
-		float deltav = abs(Speed) - StartSpeed;
-		return ceil((deltav*deltav / 2 + StartSpeed * deltav)/MaxAcceleration);
+    	float a = fmaxf(MaxAcceleration, 1e-6f);
+		if (fabsf(Speed) <= StartSpeed)	return 0;
+		float deltav = fabsf(Speed) - StartSpeed;
+		return ceil((deltav*deltav / 2 + StartSpeed * deltav)/a);
 	}
 
 	float GetNeededDeceleration()
 	{
-		float v0 = copysign(StartSpeed, Speed);
-		return (v0-Speed)*(v0+Speed)/DeltaToTarget()/2.f;
+		int64_t d = DeltaToTarget();
+		if (d == 0) return 0.0f;
+		float v0 = copysignf(StartSpeed, Speed);
+		return (v0 - Speed) * (v0 + Speed) / (2.0f * (float)d);
 	}
 
 	int GetDirectionToTarget()
@@ -84,45 +84,59 @@ struct HWStepperMotorInternal
 
 	int GetCurrentDirection()
 	{
-		if (abs(Speed) < StartSpeed)
+		if (fabsf(Speed) < StartSpeed)
 		{
 			return 0;
 		}
 		return Speed > 0 ? 1 : -1;
 	}
 
+	static inline float accel_step(float &speed, float a, int dirSign) {
+		if (a <= 0) a = 1e-6f;
+		float t = (-fabsf(speed) + sqrtf(speed*speed + 2.0f*a)) / a;
+		speed += (dirSign >= 0 ? +a : -a) * t;
+		return t;
+	}
+	
+	static inline float decel_step(float &speed, float a) {
+		if (a <= 0) a = 1e-6f;
+		float t = (-fabsf(speed) + sqrtf(speed*speed + 2.0f*a)) / a;
+		speed += (speed >= 0 ? -a : +a) * t;
+		return t;
+	}
+
 	bool ShouldAccelerate(int64_t BrakingDistance)
 	{
-		if (abs(Speed) >= MaxSpeed) // if it's already at max speed
+		if (fabsf(Speed) >= MaxSpeed)    // if it's already at max speed
 		{
-			return false; //can't go faster
+			return false;    // can't go faster
 		}
 		int currdir = GetCurrentDirection();
 		int tdir = GetDirectionToTarget();
-		if (currdir == 0 && tdir != 0) // if stopped and needs to go
+		if (currdir == 0 && tdir != 0)    // if stopped and needs to go
 		{
-			return true; //start accelerating
+			return true;    // start accelerating
 		}
 		
-		if (currdir != tdir && currdir != 0) //if going the wrong way and not stopped
+		if (currdir != tdir && currdir != 0)    // if going the wrong way and not stopped
 		{
-			return false; //don't accelerate
+			return false;    // don't accelerate
 		}
-		return (BrakingDistance < GetDistanceToTarget()); //if it takes less distance to slow down than to go to the target
+		return (BrakingDistance < GetDistanceToTarget());    // if it takes less distance to slow down than to go to the target
 	}
 
 	bool ShouldDecelerate(int64_t BrakingDistance)
 	{
 		int currdir = GetCurrentDirection();
-		if (currdir == 0) //if stopped
+		if (currdir == 0)    // if stopped
 		{
 			return false;
 		}
-		if (currdir != GetDirectionToTarget()) //if going the wrong way
+		if (currdir != GetDirectionToTarget())    // if going the wrong way
 		{
-			return true; //slow down to stop and go back
+			return true;    // slow down to stop and go back
 		}
-		return (BrakingDistance >= GetDistanceToTarget()); //if it takes longer to slow down than to go to the target
+		return (BrakingDistance >= GetDistanceToTarget());    // if it takes longer to slow down than to go to the target
 	}
 
 	uint64_t GetNextTick()
@@ -138,65 +152,70 @@ struct HWStepperMotorInternal
 				return NextTickHigh;
 			}
 		}
+
 		volatile float t = 0;
 		volatile int64_t BrakingDistance = GetBrakingDistance();
-		if (ShouldAccelerate(BrakingDistance))
-		{
-			
-			if (GetCurrentDirection() == 0)
-			{
-				Speed = StartSpeed * GetDirectionToTarget();
-				t = 1/Speed;
-				if (DirPinState != GetCurrentDirection())
-				{
+
+		if (ShouldAccelerate(BrakingDistance)) {
+			if (GetCurrentDirection() == 0) {
+				Speed = StartSpeed * GetDirectionToTarget(); 
+				if (Speed <= 0) {
+					return UINT64_MAX;
+				}
+				t = 1.0f / fabsf(Speed);
+				if (DirPinState != GetCurrentDirection()) {
 					ShouldSetDirection = true;
 				}
 			}
-			int direction = GetCurrentDirection();
-			float AccelerationSign = MaxAcceleration * direction;
-			t = (-abs(Speed) + sqrtf(Speed * Speed + 2 * MaxAcceleration))/MaxAcceleration;
-			Speed = AccelerationSign*t + Speed;
+			int dirSign = GetCurrentDirection();                  // +1 / -1
+			t = accel_step(Speed, MaxAcceleration, dirSign);      
 			HasNextTick = true;
-		}
-		else if (ShouldDecelerate(BrakingDistance))
-		{
-			volatile float Need;
-			if (GetCurrentDirection() == GetDirectionToTarget())
-			{
+
+		} else if (ShouldDecelerate(BrakingDistance)) {
+
+			float Need;
+			if (GetCurrentDirection() == GetDirectionToTarget()) {
 				Need = GetNeededDeceleration();
-				if (abs(Need) > MaxDeceleration )
-				{
-					Need = GetCurrentDirection() * MaxAcceleration * -1.f;
+				if (fabsf(Need) > MaxDeceleration) {
+					Need = -GetCurrentDirection() * MaxDeceleration;
+				}
+			} else {
+				Need = -GetCurrentDirection() * MaxDeceleration;
+			}
+
+			t = decel_step(Speed, fabsf(Need));
+			HasNextTick = true;
+
+		} else if (GetCurrentDirection() != 0) {
+
+			if (fabsf(Speed) > MaxSpeed && MaxDeceleration > 0) {
+				// slow down to MaxSpeed
+				float Need = (Speed > 0 ? -MaxDeceleration : +MaxDeceleration);
+				t = (-fabsf(Speed) + sqrtf(Speed*Speed + 2.0f*fabsf(Need))) / fmaxf(fabsf(Need), 1e-6f);
+				Speed += Need * t;
+			} else {
+				if (MaxSpeed > 0) {
+					t = 1.0f / MaxSpeed;
+					Speed = copysignf(MaxSpeed, Speed);
+				} else {
+					// Soft-Stop if MaxSpeed is 0
+					float a = fmaxf(MaxDeceleration, 1e-6f);
+					t = (-fabsf(Speed) + sqrtf(Speed*Speed + 2.0f*a)) / a;
+					Speed += (Speed >= 0 ? -a : +a) * t;
 				}
 			}
-			else
-			{
-				Need = GetCurrentDirection() * MaxAcceleration * -1.f;
-			}
-			
-			t = (-abs(Speed) + sqrtf(Speed * Speed + 2 * abs(Need)))/abs(Need);
-			Speed = Need*t + Speed;
+			HasNextTick = true;
+		}
 
-			
-			HasNextTick = true;
-		}
-		else if(GetCurrentDirection() != 0)
-		{
-			t = 1/MaxSpeed;
-			Speed = copysignf(MaxSpeed, Speed);
-			HasNextTick = true;
-		}
-		if (HasNextTick)
-		{
-			NextTickLow = (uint64_t)(t*Scale) + LastTickLow;
-			NextTickHigh = (uint64_t)(t*Scale*(1+Duty)) + LastTickLow;
+		if (HasNextTick) {
+			NextTickLow  = (uint64_t)(t * Scale) + LastTickLow;
+			NextTickHigh = (uint64_t)(t * Scale * (1 + Duty)) + LastTickLow;
 			return NextTickLow;
-		}
-		else
-		{
+		} else {
 			Speed = 0;
 			return UINT64_MAX;
 		}
+
 	}
 
 	uint64_t ConsumeTick()
@@ -261,9 +280,11 @@ void IRAM_ATTR HWStepperTimerISR()
 	else
 	{
 		uint64_t NextWait = Timings[TimerIndex].WaitBefore;
-		timerAlarmWrite(HWStepperTimer, NextWait, true);
+		if (NextWait < 50) NextWait = 50;    // minimum time to avoid issues
+		timerAlarmWrite(HWStepperTimer, NextWait, false);
 		BaseType_t Awoken = pdFALSE;
 		xSemaphoreGiveFromISR(TimingsSemaphore, &Awoken);
+		if (Awoken == pdTRUE) portYIELD_FROM_ISR();
 	}
 }
 
@@ -371,7 +392,7 @@ void TickHWStepper()
 		{
 			
 			HWTimerInput nextinput;
-			if (Steppers[indexofmin].ShouldSetDirection) //Needs a direction pin change
+			if (Steppers[indexofmin].ShouldSetDirection)    // Needs a direction pin change
 			{
 				nextinput.mask = Steppers[indexofmin].DirMask;
 				if (Steppers[indexofmin].GetCurrentDirection() == 1)
@@ -384,8 +405,9 @@ void TickHWStepper()
 				}
 				Steppers[indexofmin].DirPinState = Steppers[indexofmin].GetCurrentDirection();
 				Steppers[indexofmin].ShouldSetDirection = false;
-				nextinput.WaitBefore = (FillerTime + nextofmin)/2 - FillerTime; //Insert the direction change between the next pulse and previous pulse
-				FillerTime = (FillerTime + nextofmin)/2;
+				uint64_t mid = (nextofmin > FillerTime) ? (FillerTime + nextofmin)/2 : (FillerTime + 100);
+				nextinput.WaitBefore = mid - FillerTime;
+				FillerTime = mid;
 			}
 			else
 			{
@@ -405,7 +427,7 @@ void TickHWStepper()
 			Timings[FillerIndex] = nextinput;
 			FillerIndex = (FillerIndex >= NumTimings-1) ? 0 : FillerIndex+1;
 		}
-		else //If all motors are done
+		else    // If all motors are done
 		{
 			HWTimerInput nextinput;
 			nextinput.mask = 0;
@@ -420,17 +442,19 @@ void TickHWStepper()
 
 void StartHWStepper(uint8_t timer)
 {
-	if (HWStepperTimer == nullptr)
+    if (HWStepperTimer == nullptr)
 	{
-		HWStepperTimer = timerBegin(0, Divider, true);
-		timerAttachInterrupt(HWStepperTimer, HWStepperTimerISR, true);
-		timerAlarmWrite(HWStepperTimer, Timings[0].WaitBefore, true);
-		timerAlarmEnable(HWStepperTimer);
-	}
-	else
+        HWStepperTimer = timerBegin(timer, Divider, true);
+        timerAttachInterrupt(HWStepperTimer, HWStepperTimerISR, true);
+        uint64_t first = Timings[0].WaitBefore;
+        if (first < 50) first = 50;    // minimum time to avoid issues
+        timerAlarmWrite(HWStepperTimer, first, false); 
+        timerAlarmEnable(HWStepperTimer);
+    } 
+	else 
 	{
-		timerStart(HWStepperTimer);
-	}
+        timerStart(HWStepperTimer);
+    }
 }
 
 void RestartTimings()
@@ -451,15 +475,16 @@ void RestartTimings()
 		vSemaphoreDelete(TimingsSemaphore);
 		TimingsSemaphore = xSemaphoreCreateCounting(NumTimings,NumTimings);
 		TickHWStepper();
-		timerAlarmWrite(HWStepperTimer, Timings[0].WaitBefore, false);
-		timerWrite(HWStepperTimer, 0);
+		uint64_t first = Timings[0].WaitBefore;
+		if (first < 50) first = 50;
+		timerAlarmWrite(HWStepperTimer, first, false);
 		timerStart(HWStepperTimer);
 	}
 }
 
 void StopHWStepper()
 {
-	if (HWStepperTimer == nullptr)
+	if (HWStepperTimer != nullptr)
 	{
 		timerStop(HWStepperTimer);
 	}
